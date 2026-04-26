@@ -175,12 +175,16 @@ def _named_params_and_buffers_global(
             layer_offset = get_transformer_layer_offset(model_module.config, vp_stage)
         else:
             layer_offset = get_transformer_layer_offset(model_module.config)
+        # `(language_model\.)?` lets multimodal models (e.g. Qwen3-VL), whose
+        # LM lives under `module.module.language_model.decoder.layers.*`, also
+        # receive the PP/EP offset rewriting below.
+        decoder_layers_pattern = r"module\.module\.((?:language_model\.)?)decoder\.layers\.(\d+)\.(.+)"
+
         for name, param in model_module.named_parameters():
             # for model without ddp wrap
             if not name.startswith("module.module."):
                 name = "module." + name
 
-            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
             match = re.match(decoder_layers_pattern, name)
             if not match:
                 # MTP (Multi-Token Prediction) layers for speculative decoding
@@ -203,7 +207,7 @@ def _named_params_and_buffers_global(
                 yield f"module.module.mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.{param_type}{expert_idx}", param
                 continue
 
-            layer_idx, rest = match.groups()
+            mm_prefix, layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset
 
             # this is hardcoded for te grouped matmul
@@ -212,9 +216,9 @@ def _named_params_and_buffers_global(
             if match:
                 rest, param_type, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{rest}.{param_type}{expert_idx}", param
+                yield f"module.module.{mm_prefix}decoder.layers.{layer_idx}.mlp.experts.{rest}.{param_type}{expert_idx}", param
             else:
-                yield f"module.module.decoder.layers.{layer_idx}.{rest}", param
+                yield f"module.module.{mm_prefix}decoder.layers.{layer_idx}.{rest}", param
 
         # treat expert bias as normal parameters
         for name, buffer in model_module.named_buffers():
@@ -225,11 +229,10 @@ def _named_params_and_buffers_global(
             if not name.startswith("module.module."):
                 name = "module." + name
 
-            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
             match = re.match(decoder_layers_pattern, name)
             if not match:
                 yield name, buffer
             else:
-                layer_idx, rest = match.groups()
+                mm_prefix, layer_idx, rest = match.groups()
                 layer_idx = int(layer_idx) + layer_offset
-                yield f"module.module.decoder.layers.{layer_idx}.{rest}", buffer
+                yield f"module.module.{mm_prefix}decoder.layers.{layer_idx}.{rest}", buffer

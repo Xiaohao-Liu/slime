@@ -7,6 +7,11 @@ def remove_padding(name: str, param: torch.Tensor, vocab_size: int) -> torch.Ten
     """
     Remove vocab padding: param[:vocab_size] for embedding/output layers, else unchanged.
     """
-    if strip_param_name_prefix(name) in {"embedding.word_embeddings.weight", "output_layer.weight"}:
+    base = strip_param_name_prefix(name)
+    # Multimodal models (e.g. Qwen3-VL) place the LM under `language_model.`;
+    # strip it so the embedding/output checks below match the same as plain text models.
+    if base.startswith("language_model."):
+        base = base[len("language_model.") :]
+    if base in {"embedding.word_embeddings.weight", "output_layer.weight"}:
         return param[:vocab_size]
     return param
