@@ -13,8 +13,17 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
     assert quantization_config["activation_scheme"] == "dynamic"
     weight_block_size = quantization_config.get("weight_block_size", None)
+    # SGLang's FP8 loader honors both keys; mirror that here so the on-the-fly
+    # quantizer keeps the same module set as the static checkpoint.
+    modules_to_not_convert = (
+        quantization_config.get("modules_to_not_convert")
+        or quantization_config.get("ignored_layers")
+        or []
+    )
 
-    decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
+    # Accept the Qwen3-VL prefix (`language_model.`) in addition to the plain
+    # decoder prefix so the LM weights of multimodal models are quantized too.
+    decoder_layers_pattern = r"module\.module\.(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)
 
     if not match:
@@ -37,15 +46,12 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
             "linear_fc1",
             "linear_fc2",
         ]:
-            quantize_named_params = []
-            for converted_name, param in converted_named_params:
-                # skip bf16 weight_scale and input_scale
-                # TODO: find a clearer way.
-                if converted_name.endswith("_scale"):
-                    continue
-                quantize_named_params.extend(_quantize_param(converted_name, param, weight_block_size))
-
-            return quantize_named_params
+            return _quantize_named_params(
+                converted_named_params,
+                weight_block_size,
+                modules_to_not_convert,
+                drop_existing_scales=True,
+            )
 
     # shared expert
     shared_expert_pattern = r"mlp.shared_experts\.(.+)"
@@ -56,11 +62,11 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
             "linear_fc1.weight",
             "linear_fc2.weight",
         ]:
-            quantize_named_params = []
-            for converted_name, param in converted_named_params:
-                quantize_named_params.extend(_quantize_param(converted_name, param, weight_block_size))
-
-            return quantize_named_params
+            return _quantize_named_params(
+                converted_named_params,
+                weight_block_size,
+                modules_to_not_convert,
+            )
 
     if rest in [
         "self_attention.linear_proj.weight",
@@ -81,14 +87,50 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         "self_attention.linear_attn.in_proj_z.weight",
         "self_attention.linear_attn.out_proj.weight",
     ]:
-        quantize_named_params = []
-        for converted_name, param in converted_named_params:
-            quantize_named_params.extend(_quantize_param(converted_name, param, weight_block_size))
-
-        return quantize_named_params
+        return _quantize_named_params(
+            converted_named_params,
+            weight_block_size,
+            modules_to_not_convert,
+        )
 
     # for other parameters, we just return the original converted_named_params
     return converted_named_params
+
+
+def _quantize_named_params(
+    converted_named_params,
+    weight_block_size,
+    modules_to_not_convert,
+    *,
+    drop_existing_scales=False,
+):
+    out = []
+    for converted_name, param in converted_named_params:
+        # skip bf16 weight_scale / input_scale that some converters emit;
+        # we will regenerate the scale during quantization below.
+        if drop_existing_scales and converted_name.endswith("_scale"):
+            continue
+        if _is_module_skipped(converted_name, modules_to_not_convert):
+            # Module is in the FP8 checkpoint's not-convert list; pass it
+            # through as BF16 so the dtype matches what SGLang expects.
+            out.append((converted_name, param))
+            continue
+        out.extend(_quantize_param(converted_name, param, weight_block_size))
+    return out
+
+
+def _is_module_skipped(weight_name, modules_to_not_convert):
+    if not modules_to_not_convert:
+        return False
+    base = weight_name
+    for suffix in (".weight_scale_inv", ".weight_scale", ".weight", ".bias"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    for entry in modules_to_not_convert:
+        if base == entry or base.startswith(entry + "."):
+            return True
+    return False
 
 
 def _quantize_param(name, weight, weight_block_size):
